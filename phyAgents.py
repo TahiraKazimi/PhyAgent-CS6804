@@ -218,20 +218,25 @@ class PlannerAgent:
 # ============================================================================
 # Generator Agent (Wan2.1-14B)
 # ============================================================================
+import os
+from datetime import datetime
+
 
 class GeneratorAgent:
-    """Wraps Wan2.1-14B and accepts evaluator feedback for regeneration."""
+    """Wraps Wan2.1 and accepts evaluator feedback for regeneration."""
 
     def __init__(
         self,
-        model_id: str = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        model_id: str = "Wan-AI/Wan2.1-T2V-14B-Diffusers",
         device: str = "cuda",
         height: int = 480,
         width: int = 832,
         num_frames: int = 81,
         guidance_scale: float = 6.0,
-        num_inference_steps: int = 35,
+        num_inference_steps: int = 40,
         flow_shift: float = 3.0,
+        output_dir: Optional[str] = "outputs/videos",
+        fps: int = 16,
     ):
         self.model_id = model_id
         self.device = device
@@ -241,13 +246,18 @@ class GeneratorAgent:
         self.guidance_scale = guidance_scale
         self.num_inference_steps = num_inference_steps
         self.flow_shift = flow_shift
+        self.output_dir = output_dir
+        self.fps = fps
         self._pipe = None
+
+        if self.output_dir is not None:
+            os.makedirs(self.output_dir, exist_ok=True)
 
     def _load(self):
         if self._pipe is not None:
             return
         from diffusers import WanPipeline, UniPCMultistepScheduler
-        print(f"Loading Wan2.1-14B from {self.model_id}...")
+        print(f"Loading Wan2.1 from {self.model_id}...")
         self._pipe = WanPipeline.from_pretrained(self.model_id, torch_dtype=torch.bfloat16)
         self._pipe.scheduler = UniPCMultistepScheduler.from_config(
             self._pipe.scheduler.config, flow_shift=self.flow_shift
@@ -270,15 +280,35 @@ class GeneratorAgent:
             parts.append(f"Important: {hint}")
         return " ".join(parts)
 
+    @staticmethod
+    def _slugify(text: str, max_len: int = 40) -> str:
+        """Make a filesystem-safe filename fragment from a prompt."""
+        s = re.sub(r"[^a-zA-Z0-9]+", "_", text.strip().lower()).strip("_")
+        return s[:max_len] or "video"
+
+    def _save_video(self, frames: np.ndarray, save_path: str):
+        """Write (T, H, W, C) uint8 frames to disk as mp4."""
+        import imageio
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        with imageio.get_writer(save_path, fps=self.fps, codec="libx264",
+                                quality=8, macro_block_size=1) as w:
+            for f in frames:
+                w.append_data(f)
+        print(f"[Generator] saved video → {save_path}")
+
     def generate(
         self,
         prompt: str,
         reference_trees: List[ReferenceTree],
         regenerate_hint: Optional[str] = None,
         seed: Optional[int] = None,
+        save_path: Optional[str] = None,
+        attempt: Optional[int] = None,
     ):
         self._load()
         full_prompt = self._augment_prompt(prompt, regenerate_hint, reference_trees)
+        import random
+        seed = random.randint(0, 2**31-1)
         gen = torch.Generator(device=self.device).manual_seed(seed) if seed is not None else None
 
         with torch.no_grad():
@@ -316,12 +346,128 @@ class GeneratorAgent:
         # If channels-first (T, C, H, W), transpose
         if frames.ndim == 4 and frames.shape[1] in (1, 3) and frames.shape[-1] not in (1, 3):
             frames = frames.transpose(0, 2, 3, 1)
+
+        # ── Save ────────────────────────────────────────────────────
+        # Priority: explicit save_path > auto-named under output_dir > skip
+        if save_path is not None:
+            self._save_video(frames, save_path)
+        elif self.output_dir is not None:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            slug = self._slugify(prompt)
+            attempt_tag = f"_a{attempt}" if attempt is not None else ""
+            seed_tag = f"_s{seed}" if seed is not None else ""
+            fname = f"{ts}_{slug}{attempt_tag}{seed_tag}.mp4"
+            self._save_video(frames, os.path.join(self.output_dir, fname))
+
         return frames
 
     def to_cpu(self):
         if self._pipe is not None:
             self._pipe.to("cpu")
             torch.cuda.empty_cache()
+# class GeneratorAgent:
+#     """Wraps Wan2.1-14B and accepts evaluator feedback for regeneration."""
+
+#     def __init__(
+#         self,
+#         model_id: str = "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+#         device: str = "cuda",
+#         height: int = 480,
+#         width: int = 832,
+#         num_frames: int = 81,
+#         guidance_scale: float = 6.0,
+#         num_inference_steps: int = 35,
+#         flow_shift: float = 3.0,
+#     ):
+#         self.model_id = model_id
+#         self.device = device
+#         self.height = height
+#         self.width = width
+#         self.num_frames = num_frames
+#         self.guidance_scale = guidance_scale
+#         self.num_inference_steps = num_inference_steps
+#         self.flow_shift = flow_shift
+#         self._pipe = None
+
+#     def _load(self):
+#         if self._pipe is not None:
+#             return
+#         from diffusers import WanPipeline, UniPCMultistepScheduler
+#         print(f"Loading Wan2.1-14B from {self.model_id}...")
+#         self._pipe = WanPipeline.from_pretrained(self.model_id, torch_dtype=torch.bfloat16)
+#         self._pipe.scheduler = UniPCMultistepScheduler.from_config(
+#             self._pipe.scheduler.config, flow_shift=self.flow_shift
+#         )
+#         self._pipe.to(self.device)
+
+#     def _augment_prompt(self, prompt: str, hint: Optional[str], trees: List[ReferenceTree]) -> str:
+#         """Inject planner stages and evaluator feedback into the generation prompt."""
+#         parts = [prompt]
+#         if trees:
+#             stage_lines = []
+#             for t in trees:
+#                 top_stages = ", ".join(s["name"] for s in t.stages)
+#                 stage_lines.append(f"{t.principle_name}: {top_stages}")
+#             parts.append(
+#                 "Show the following physical processes unfolding in chronological order. "
+#                 + "; ".join(stage_lines) + "."
+#             )
+#         if hint:
+#             parts.append(f"Important: {hint}")
+#         return " ".join(parts)
+
+#     def generate(
+#         self,
+#         prompt: str,
+#         reference_trees: List[ReferenceTree],
+#         regenerate_hint: Optional[str] = None,
+#         seed: Optional[int] = None,
+#     ):
+#         self._load()
+#         full_prompt = self._augment_prompt(prompt, regenerate_hint, reference_trees)
+#         gen = torch.Generator(device=self.device).manual_seed(seed) if seed is not None else None
+
+#         with torch.no_grad():
+#             out = self._pipe(
+#                 prompt=full_prompt,
+#                 height=self.height,
+#                 width=self.width,
+#                 num_frames=self.num_frames,
+#                 guidance_scale=self.guidance_scale,
+#                 num_inference_steps=self.num_inference_steps,
+#                 generator=gen,
+#             )
+#         # diffusers returns frames as list of PIL images; stack to (T,H,W,C) np.uint8
+#         raw = out.frames[0]
+#         # Handle all the shapes diffusers might return
+#         if isinstance(raw, list):
+#             # list of PIL images
+#             if hasattr(raw[0], "convert"):
+#                 frames = np.stack([np.array(f.convert("RGB")) for f in raw], axis=0)
+#             else:
+#                 # list of arrays
+#                 frames = np.stack([np.asarray(f) for f in raw], axis=0)
+#         elif isinstance(raw, torch.Tensor):
+#             frames = raw.detach().cpu().numpy()
+#         else:
+#             frames = np.asarray(raw)
+
+#         # Normalize to uint8 (T, H, W, C)
+#         if frames.dtype != np.uint8:
+#             if frames.max() <= 1.0 + 1e-3:
+#                 frames = (frames.clip(0, 1) * 255).round().astype(np.uint8)
+#             else:
+#                 frames = frames.clip(0, 255).astype(np.uint8)
+
+#         # If channels-first (T, C, H, W), transpose
+#         if frames.ndim == 4 and frames.shape[1] in (1, 3) and frames.shape[-1] not in (1, 3):
+#             frames = frames.transpose(0, 2, 3, 1)
+#         return frames
+
+#     def to_cpu(self):
+#         if self._pipe is not None:
+#             self._pipe.to("cpu")
+#             torch.cuda.empty_cache()
 
 
 # ============================================================================
@@ -634,6 +780,7 @@ class PhyAgent:
                 reference_trees=trees,
                 regenerate_hint=hint,
                 seed=self.seed_base + attempt,
+                attempt=attempt,
             )
 
             # 3. Evaluate
